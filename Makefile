@@ -45,6 +45,8 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 REMOVE_EXTENSIONS = 1
 CODESIGN_IPA = 0
 
+// this checks whether the built IPA is signed officially, whether thru Apple or a 3rd party development licnece
+
 UYOU_PATH = Tweaks/uYou
 UYOU_DEB = $(UYOU_PATH)/com.miro.uyou_$(UYOU_VERSION)_iphoneos-arm.deb
 UYOU_DYLIB = $(UYOU_PATH)/Library/MobileSubstrate/DynamicLibraries/uYou.dylib
