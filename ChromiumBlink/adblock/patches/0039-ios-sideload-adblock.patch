@@ -1,0 +1,1252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ios-blink-sideload <noreply@example.invalid>
+Date: Mon, 2 Nov 2026 17:01:14 +0000
+Subject: [PATCH] iOS sideload: ad and content blocking with uBlock Origin's
+ lists
+
+Blocks ads, trackers and malware with Chromium's own subresource filter,
+fed with filter lists compiled from uBlock Origin's default lists (uBlock
+filters, EasyList, EasyPrivacy, Peter Lowe's list, Online Malicious URL
+Blocklist) by compile_filters.py at build time.
+
+- ios/web/content/adblock/adblock_ruleset: on first launch, parses the
+  bundled adblock_filters.txt with Chromium's EasyList parser
+  (components/subresource_filter/tools/rule_parser) and indexes it with
+  subresource_filter::RulesetIndexer. The index is cached in
+  Library/Caches/SideloadAdblock and verified on later launches; it is
+  rebuilt when the list or the Chromium version changes.
+- AdblockRenderFrameObserver: installs a WebDocumentSubresourceFilterImpl
+  on every web document (and worker), so Blink blocks matching subresource
+  loads; Chrome normally only does this on sites Safe Browsing flags.
+  Element hiding: inserts a user-origin stylesheet with the site-specific
+  `##` rules for the document's site (from the index), plus the generic
+  ones (compiled stylesheet) in main frames.
+- AdblockNavigationThrottle: blocks and collapses matching iframes.
+- $document, $genericblock, $elemhide and $generichide allowlist rules are
+  honoured and inherited by child frames.
+- chrome://flags: "Ad and content blocking" and "Ad blocking: hide ad
+  placeholders", both on by default.
+- GN arg ios_sideload_adblock_lists_dir: directory with the compiled
+  lists, bundled into the app. Unset means no lists and no blocking.
+
+Not supported (dropped at compile time, never broadened): scriptlets
+(##+js), HTML filtering (##^), procedural cosmetic filters, $redirect,
+$removeparam, $csp, $denyallow, regex filters, entity domains, strict
+blocking of top-level pages.
+
+Status: written against Chromium 3313f827 + patches 0001-0038 and applies
+cleanly on top of them; NOT yet compiled or run (needs a Mac).
+---
+ chrome/browser/flag-metadata.json             |  10 +
+ ios/chrome/browser/flags/about_flags.mm       |   9 +
+ .../flags/ios_chrome_flag_descriptions.h      |  14 +
+ ios/web/common/features.h                     |   7 +
+ ios/web/common/features.mm                    |   5 +
+ ios/web/content/adblock/BUILD.gn              |  58 ++++
+ ios/web/content/adblock/DEPS                  |  11 +
+ ios/web/content/adblock/adblock.gni           |  11 +
+ .../adblock/adblock_navigation_throttle.h     |  44 +++
+ .../adblock/adblock_navigation_throttle.mm    | 115 +++++++
+ .../adblock/adblock_render_frame_observer.h   |  62 ++++
+ .../adblock/adblock_render_frame_observer.mm  | 231 ++++++++++++++
+ ios/web/content/adblock/adblock_ruleset.h     | 108 +++++++
+ ios/web/content/adblock/adblock_ruleset.mm    | 300 ++++++++++++++++++
+ ios/web/content/init/BUILD.gn                 |   1 +
+ .../content/init/ios_browser_main_parts.mm    |   4 +
+ .../init/ios_content_browser_client.cc        |   6 +
+ .../content/init/ios_content_browser_client.h |   3 +
+ .../init/ios_content_renderer_client.cc       |   3 +
+ 19 files changed, 1002 insertions(+)
+ create mode 100644 ios/web/content/adblock/BUILD.gn
+ create mode 100644 ios/web/content/adblock/DEPS
+ create mode 100644 ios/web/content/adblock/adblock.gni
+ create mode 100644 ios/web/content/adblock/adblock_navigation_throttle.h
+ create mode 100644 ios/web/content/adblock/adblock_navigation_throttle.mm
+ create mode 100644 ios/web/content/adblock/adblock_render_frame_observer.h
+ create mode 100644 ios/web/content/adblock/adblock_render_frame_observer.mm
+ create mode 100644 ios/web/content/adblock/adblock_ruleset.h
+ create mode 100644 ios/web/content/adblock/adblock_ruleset.mm
+
+diff --git a/chrome/browser/flag-metadata.json b/chrome/browser/flag-metadata.json
+index d4681a1457a001221f5871ea88ec6903720fbd0b..55dca4a0e0c917febf421f425b21e585c6a817de 100644
+--- a/chrome/browser/flag-metadata.json
++++ b/chrome/browser/flag-metadata.json
+@@ -6559,6 +6559,16 @@
+     ],
+     "expiry_milestone": 162
+   },
++  {
++    "name": "ios-sideload-adblock",
++    "owners": [ "ios-blink-sideload@example.invalid" ],
++    "expiry_milestone": 200
++  },
++  {
++    "name": "ios-sideload-adblock-element-hiding",
++    "owners": [ "ios-blink-sideload@example.invalid" ],
++    "expiry_milestone": 200
++  },
+   {
+     "name": "ios-signal-sharing",
+     "owners": [ "mickaczmarczyk@google.com", "szymonkurek@google.com" ],
+diff --git a/ios/chrome/browser/flags/about_flags.mm b/ios/chrome/browser/flags/about_flags.mm
+index 2de1bceb6c8ff09d3af1a9486f9596f9af7fa2a1..0e21d42d4bf4b1807cddb38a87f07078c7b7fd2e 100644
+--- a/ios/chrome/browser/flags/about_flags.mm
++++ b/ios/chrome/browser/flags/about_flags.mm
+@@ -2902,6 +2902,15 @@ constexpr auto kFeatureEntries = std::to_array<flags_ui::FeatureEntry>({
+     {"web-frame-tree", flag_descriptions::kWebFrameTreeName,
+      flag_descriptions::kWebFrameTreeDescription, flags_ui::kOsIos,
+      FEATURE_VALUE_TYPE(web::features::kWebFrameTree)},
++    // [ios-blink-sideload] Ad blocking switches.
++    {"ios-sideload-adblock", flag_descriptions::kIOSSideloadAdblockName,
++     flag_descriptions::kIOSSideloadAdblockDescription, flags_ui::kOsIos,
++     FEATURE_VALUE_TYPE(web::features::kIOSSideloadAdblock)},
++    {"ios-sideload-adblock-element-hiding",
++     flag_descriptions::kIOSSideloadAdblockElementHidingName,
++     flag_descriptions::kIOSSideloadAdblockElementHidingDescription,
++     flags_ui::kOsIos,
++     FEATURE_VALUE_TYPE(web::features::kIOSSideloadAdblockElementHiding)},
+     {"glic-actor-autofill", flag_descriptions::kGlicActorAutofillName,
+      flag_descriptions::kGlicActorAutofillDescription, flags_ui::kOsIos,
+      FEATURE_VALUE_TYPE(autofill::features::kGlicActorAutofill)},
+diff --git a/ios/chrome/browser/flags/ios_chrome_flag_descriptions.h b/ios/chrome/browser/flags/ios_chrome_flag_descriptions.h
+index 4a74e82fc36ca535d7a5d4b6eeb5fb7fb8ce395c..b5a40fc9d14aea21320b088eab17f2a0322de117 100644
+--- a/ios/chrome/browser/flags/ios_chrome_flag_descriptions.h
++++ b/ios/chrome/browser/flags/ios_chrome_flag_descriptions.h
+@@ -2072,6 +2072,20 @@ inline constexpr char kWalletServiceUseSandboxName[] =
+ inline constexpr char kWalletServiceUseSandboxDescription[] =
+     "Uses the sandbox service for Google Payments API calls.";
+ 
++// [ios-blink-sideload]
++inline constexpr char kIOSSideloadAdblockName[] = "Ad and content blocking";
++inline constexpr char kIOSSideloadAdblockDescription[] =
++    "Blocks ads, trackers and malware using filter lists compiled from "
++    "uBlock Origin's default lists (uBlock filters, EasyList, EasyPrivacy, "
++    "Peter Lowe's list, Online Malicious URL Blocklist). Restart the app "
++    "after changing this.";
++inline constexpr char kIOSSideloadAdblockElementHidingName[] =
++    "Ad blocking: hide ad placeholders";
++inline constexpr char kIOSSideloadAdblockElementHidingDescription[] =
++    "Hides page elements matched by the filter lists' element hiding "
++    "rules (##), in addition to blocking requests. Takes effect on the next "
++    "page load.";
++
+ inline constexpr char kWebFrameTreeName[] = "WebFrame Tree Structure";
+ inline constexpr char kWebFrameTreeDescription[] =
+     "Enables building a tree structure of WebFrames using isolated world "
+diff --git a/ios/web/common/features.h b/ios/web/common/features.h
+index 3e2d14cf202f17535bb336c6dc68998cf336e84a..5b465176cb08077a31e5e04c630309578c55aa18 100644
+--- a/ios/web/common/features.h
++++ b/ios/web/common/features.h
+@@ -154,6 +154,13 @@ BASE_DECLARE_FEATURE(kWebFrameTree);
+ // Enables the new geolocation permission delegate feature.
+ BASE_DECLARE_FEATURE(kNewGeolocationPermissionDelegate);
+ 
++// [ios-blink-sideload] Ad and content blocking with filter lists compiled
++// from uBlock Origin's default lists (Blink builds only; see
++// ios/web/content/adblock).
++BASE_DECLARE_FEATURE(kIOSSideloadAdblock);
++// [ios-blink-sideload] Element hiding (cosmetic filtering) part of the above.
++BASE_DECLARE_FEATURE(kIOSSideloadAdblockElementHiding);
++
+ }  // namespace web::features
+ 
+ #endif  // IOS_WEB_COMMON_FEATURES_H_
+diff --git a/ios/web/common/features.mm b/ios/web/common/features.mm
+index cff1ab23fcc01a6b456d4cd2cf7ff14d4e66589f..4612bd71cb146243f5f561a3bb6fcc99950a1532 100644
+--- a/ios/web/common/features.mm
++++ b/ios/web/common/features.mm
+@@ -128,4 +128,9 @@ BASE_FEATURE(kWebFrameTree, base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE(kNewGeolocationPermissionDelegate,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++BASE_FEATURE(kIOSSideloadAdblock, base::FEATURE_ENABLED_BY_DEFAULT);
++
++BASE_FEATURE(kIOSSideloadAdblockElementHiding,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
+ }  // namespace web::features
+diff --git a/ios/web/content/adblock/BUILD.gn b/ios/web/content/adblock/BUILD.gn
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef56f0c875cb823bdc262de199963b68a400c73b
+--- /dev/null
++++ b/ios/web/content/adblock/BUILD.gn
+@@ -0,0 +1,58 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# [ios-blink-sideload] Ad and content blocking for the single-process Blink
++# build, using Chromium's subresource filter with filter lists compiled from
++# uBlock Origin's default lists (see adblock.gni).
++
++import("//ios/web/content/adblock/adblock.gni")
++
++source_set("adblock") {
++  sources = [
++    "adblock_navigation_throttle.h",
++    "adblock_navigation_throttle.mm",
++    "adblock_render_frame_observer.h",
++    "adblock_render_frame_observer.mm",
++    "adblock_ruleset.h",
++    "adblock_ruleset.mm",
++  ]
++
++  deps = [
++    "//base",
++    "//components/subresource_filter/content/renderer",
++    "//components/subresource_filter/core/common",
++    "//components/subresource_filter/core/mojom",
++    "//components/subresource_filter/tools/rule_parser",
++    "//components/url_pattern_index",
++    "//components/url_pattern_index/proto:url_pattern_index",
++    "//components/version_info",
++    "//content/public/browser",
++    "//content/public/renderer",
++    "//ios/web/common:features",
++    "//third_party/blink/public:blink",
++    "//third_party/blink/public:blink_headers",
++    "//third_party/blink/public/common",
++    "//url",
++  ]
++
++  if (ios_sideload_adblock_lists_dir != "") {
++    deps += [ ":filter_lists" ]
++  }
++
++  frameworks = [ "Foundation.framework" ]
++}
++
++if (ios_sideload_adblock_lists_dir != "") {
++  # The three files written by compile_filters.py. They end up in the bundle
++  # that links this code; adblock_ruleset.mm looks in that bundle and in the
++  # main app bundle.
++  bundle_data("filter_lists") {
++    sources = [
++      "$ios_sideload_adblock_lists_dir/adblock_filters.txt",
++      "$ios_sideload_adblock_lists_dir/adblock_generic.css",
++      "$ios_sideload_adblock_lists_dir/adblock_generic_exceptions.txt",
++    ]
++    outputs = [ "{{bundle_resources_dir}}/{{source_file_part}}" ]
++  }
++}
+diff --git a/ios/web/content/adblock/DEPS b/ios/web/content/adblock/DEPS
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e02de68a1023442d62456ef8882ddec31fe822c
+--- /dev/null
++++ b/ios/web/content/adblock/DEPS
+@@ -0,0 +1,11 @@
++include_rules = [
++  "+components/subresource_filter/content/renderer",
++  "+components/subresource_filter/core/common",
++  "+components/subresource_filter/core/mojom",
++  "+components/subresource_filter/tools/rule_parser",
++  "+components/url_pattern_index",
++  "+components/version_info",
++  "+content/public/renderer",
++  "+third_party/blink/public/platform",
++  "+third_party/blink/public/web",
++]
+diff --git a/ios/web/content/adblock/adblock.gni b/ios/web/content/adblock/adblock.gni
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea7276cf90c35958484817cd7fef05398ea14138
+--- /dev/null
++++ b/ios/web/content/adblock/adblock.gni
+@@ -0,0 +1,11 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++declare_args() {
++  # [ios-blink-sideload] Absolute path of a directory holding the output of
++  # compile_filters.py (adblock_filters.txt, adblock_generic.css and
++  # adblock_generic_exceptions.txt). The files are copied into the app. Empty
++  # means no lists are bundled, and ad blocking stays inactive.
++  ios_sideload_adblock_lists_dir = ""
++}
+diff --git a/ios/web/content/adblock/adblock_navigation_throttle.h b/ios/web/content/adblock/adblock_navigation_throttle.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb22731a9d267edc78daf8e908eb7574a5367fff
+--- /dev/null
++++ b/ios/web/content/adblock/adblock_navigation_throttle.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_NAVIGATION_THROTTLE_H_
++#define IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_NAVIGATION_THROTTLE_H_
++
++#include "content/public/browser/navigation_throttle.h"
++
++namespace content {
++class NavigationThrottleRegistry;
++}  // namespace content
++
++namespace web::adblock {
++
++// [ios-blink-sideload] Blocks iframe navigations that match the ad blocking
++// ruleset and collapses the iframe, like Chrome's
++// ChildFrameNavigationFilteringThrottle. Subresources are filtered in the
++// renderer (AdblockRenderFrameObserver); iframe documents are navigations, so
++// they are checked here. Top-level navigations are never blocked.
++class AdblockNavigationThrottle : public content::NavigationThrottle {
++ public:
++  // Adds the throttle for subframe navigations when ad blocking is on.
++  static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry);
++
++  explicit AdblockNavigationThrottle(
++      content::NavigationThrottleRegistry& registry);
++  AdblockNavigationThrottle(const AdblockNavigationThrottle&) = delete;
++  AdblockNavigationThrottle& operator=(const AdblockNavigationThrottle&) =
++      delete;
++  ~AdblockNavigationThrottle() override;
++
++  // content::NavigationThrottle:
++  ThrottleCheckResult WillStartRequest() override;
++  ThrottleCheckResult WillRedirectRequest() override;
++  const char* GetNameForLogging() override;
++
++ private:
++  ThrottleCheckResult CheckCurrentUrl();
++};
++
++}  // namespace web::adblock
++
++#endif  // IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_NAVIGATION_THROTTLE_H_
+diff --git a/ios/web/content/adblock/adblock_navigation_throttle.mm b/ios/web/content/adblock/adblock_navigation_throttle.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..25061bbdb187ff79db5956f89034d65d6b4b2155
+--- /dev/null
++++ b/ios/web/content/adblock/adblock_navigation_throttle.mm
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/web/content/adblock/adblock_navigation_throttle.h"
++
++#import <memory>
++
++#import "base/feature_list.h"
++#import "components/subresource_filter/core/common/first_party_origin.h"
++#import "components/subresource_filter/core/common/indexed_ruleset.h"
++#import "components/subresource_filter/core/common/load_policy.h"
++#import "components/url_pattern_index/proto/rules.pb.h"
++#import "content/public/browser/navigation_handle.h"
++#import "content/public/browser/navigation_throttle_registry.h"
++#import "content/public/browser/render_frame_host.h"
++#import "ios/web/common/features.h"
++#import "ios/web/content/adblock/adblock_ruleset.h"
++#import "url/gurl.h"
++#import "url/origin.h"
++
++namespace web::adblock {
++
++namespace {
++
++using url_pattern_index::proto::ACTIVATION_TYPE_DOCUMENT;
++using url_pattern_index::proto::ACTIVATION_TYPE_GENERICBLOCK;
++
++}  // namespace
++
++// static
++void AdblockNavigationThrottle::MaybeCreateAndAdd(
++    content::NavigationThrottleRegistry& registry) {
++  if (!base::FeatureList::IsEnabled(web::features::kIOSSideloadAdblock) ||
++      registry.GetNavigationHandle().IsInMainFrame()) {
++    return;
++  }
++  registry.AddThrottle(std::make_unique<AdblockNavigationThrottle>(registry));
++}
++
++AdblockNavigationThrottle::AdblockNavigationThrottle(
++    content::NavigationThrottleRegistry& registry)
++    : content::NavigationThrottle(registry) {}
++
++AdblockNavigationThrottle::~AdblockNavigationThrottle() = default;
++
++content::NavigationThrottle::ThrottleCheckResult
++AdblockNavigationThrottle::WillStartRequest() {
++  return CheckCurrentUrl();
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++AdblockNavigationThrottle::WillRedirectRequest() {
++  return CheckCurrentUrl();
++}
++
++const char* AdblockNavigationThrottle::GetNameForLogging() {
++  return "AdblockNavigationThrottle";
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++AdblockNavigationThrottle::CheckCurrentUrl() {
++  const GURL& url = navigation_handle()->GetURL();
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    return PROCEED;
++  }
++  content::RenderFrameHost* parent =
++      navigation_handle()->GetParentFrameOrOuterDocument();
++  if (!parent) {
++    return PROCEED;
++  }
++  scoped_refptr<const AdblockRuleset::Data> data =
++      AdblockRuleset::GetInstance().GetData();
++  if (!data) {
++    return PROCEED;
++  }
++
++  subresource_filter::IndexedRulesetMatcher matcher(data->indexed_bytes());
++
++  // An allowlist rule with $document (or $genericblock) on the parent
++  // document or any of its ancestors turns blocking off (or generic blocking
++  // rules off) for everything below it; see ComputeActivationState().
++  bool disable_generic_rules = false;
++  for (content::RenderFrameHost* frame = parent; frame;
++       frame = frame->GetParentOrOuterDocument()) {
++    const GURL& document_url = frame->GetLastCommittedURL();
++    if (!document_url.SchemeIsHTTPOrHTTPS()) {
++      continue;
++    }
++    content::RenderFrameHost* frame_parent = frame->GetParentOrOuterDocument();
++    const url::Origin parent_origin =
++        frame_parent ? frame_parent->GetLastCommittedOrigin() : url::Origin();
++    if (matcher.ShouldDisableFilteringForDocument(document_url, parent_origin,
++                                                  ACTIVATION_TYPE_DOCUMENT)) {
++      return PROCEED;
++    }
++    if (matcher.ShouldDisableFilteringForDocument(
++            document_url, parent_origin, ACTIVATION_TYPE_GENERICBLOCK)) {
++      disable_generic_rules = true;
++    }
++  }
++
++  subresource_filter::LoadPolicy load_policy =
++      matcher.GetLoadPolicyForResourceLoad(
++          url,
++          subresource_filter::FirstPartyOrigin(
++              parent->GetLastCommittedOrigin()),
++          url_pattern_index::proto::ELEMENT_TYPE_SUBDOCUMENT,
++          disable_generic_rules, /*out_rule=*/nullptr);
++  return load_policy == subresource_filter::LoadPolicy::DISALLOW
++             ? BLOCK_REQUEST_AND_COLLAPSE
++             : PROCEED;
++}
++
++}  // namespace web::adblock
+diff --git a/ios/web/content/adblock/adblock_render_frame_observer.h b/ios/web/content/adblock/adblock_render_frame_observer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e03b6a1d13b6d1760d6f699aa3c4728aafd0dbf4
+--- /dev/null
++++ b/ios/web/content/adblock/adblock_render_frame_observer.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_RENDER_FRAME_OBSERVER_H_
++#define IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_RENDER_FRAME_OBSERVER_H_
++
++#include <string>
++
++#include "components/subresource_filter/core/mojom/subresource_filter.mojom.h"
++#include "content/public/renderer/render_frame_observer.h"
++#include "content/public/renderer/render_frame_observer_tracker.h"
++#include "url/origin.h"
++
++namespace web::adblock {
++
++// [ios-blink-sideload] Applies the ad blocking ruleset to each document in a
++// frame, much like subresource_filter::SubresourceFilterAgent, but always
++// active (Chrome only activates the filter on sites Safe Browsing flags):
++//  - installs a blink::WebDocumentSubresourceFilter, so Blink blocks matching
++//    subresource loads (scripts, images, XHR/fetch, ...), also in workers;
++//  - inserts a user stylesheet hiding elements that match the element hiding
++//    rules for the document's site, plus the generic ones in main frames.
++// Allowlist rules with $document, $genericblock, $elemhide and $generichide
++// are honoured, and inherited by child frames.
++class AdblockRenderFrameObserver
++    : public content::RenderFrameObserver,
++      public content::RenderFrameObserverTracker<AdblockRenderFrameObserver> {
++ public:
++  // Deletes itself when the frame goes away.
++  explicit AdblockRenderFrameObserver(content::RenderFrame* render_frame);
++  AdblockRenderFrameObserver(const AdblockRenderFrameObserver&) = delete;
++  AdblockRenderFrameObserver& operator=(const AdblockRenderFrameObserver&) =
++      delete;
++  ~AdblockRenderFrameObserver() override;
++
++  // content::RenderFrameObserver:
++  void DidCreateNewDocument() override;
++  void DidCreateDocumentElement() override;
++  void WillCreateWorkerFetchContext(blink::WebWorkerFetchContext*) override;
++  void OnDestruct() override;
++
++ private:
++  // State of the current document, inherited by documents in child frames.
++  struct DocumentState {
++    bool filtering_disabled = false;         // $document
++    bool generic_blocking_disabled = false;  // $genericblock
++    bool hiding_disabled = false;            // $elemhide
++    bool generic_hiding_disabled = false;    // $generichide
++  };
++
++  DocumentState state_;
++  bool has_filter_ = false;
++  url::Origin document_origin_;
++  subresource_filter::mojom::ActivationState activation_state_;
++  // Element hiding stylesheet, inserted once the document element exists.
++  std::string pending_css_;
++};
++
++}  // namespace web::adblock
++
++#endif  // IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_RENDER_FRAME_OBSERVER_H_
+diff --git a/ios/web/content/adblock/adblock_render_frame_observer.mm b/ios/web/content/adblock/adblock_render_frame_observer.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..e224c6dc161f7b8dfe70b54e9683753ddee41b04
+--- /dev/null
++++ b/ios/web/content/adblock/adblock_render_frame_observer.mm
+@@ -0,0 +1,231 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/web/content/adblock/adblock_render_frame_observer.h"
++
++#import <memory>
++#import <string_view>
++#import <utility>
++#import <vector>
++
++#import "base/feature_list.h"
++#import "base/files/file.h"
++#import "base/functional/callback_helpers.h"
++#import "base/no_destructor.h"
++#import "components/subresource_filter/content/renderer/web_document_subresource_filter_impl.h"
++#import "components/subresource_filter/core/common/indexed_ruleset.h"
++#import "components/subresource_filter/core/common/memory_mapped_ruleset.h"
++#import "components/url_pattern_index/proto/rules.pb.h"
++#import "content/public/renderer/render_frame.h"
++#import "ios/web/common/features.h"
++#import "ios/web/content/adblock/adblock_ruleset.h"
++#import "third_party/blink/public/platform/web_string.h"
++#import "third_party/blink/public/platform/web_worker_fetch_context.h"
++#import "third_party/blink/public/web/web_css_origin.h"
++#import "third_party/blink/public/web/web_document.h"
++#import "third_party/blink/public/web/web_document_loader.h"
++#import "third_party/blink/public/web/web_frame.h"
++#import "third_party/blink/public/web/web_local_frame.h"
++#import "url/gurl.h"
++#import "url/url_constants.h"
++#import "url/url_util.h"
++
++namespace web::adblock {
++
++namespace {
++
++using url_pattern_index::proto::ACTIVATION_TYPE_DOCUMENT;
++using url_pattern_index::proto::ACTIVATION_TYPE_ELEMHIDE;
++using url_pattern_index::proto::ACTIVATION_TYPE_GENERICBLOCK;
++using url_pattern_index::proto::ACTIVATION_TYPE_GENERICHIDE;
++
++constexpr char kHideDeclaration[] = "{display:none!important}\n";
++
++// The ruleset mapped for this (the renderer main) thread.
++// subresource_filter::MemoryMappedRuleset is not thread-safe, so the renderer
++// keeps its own mapping instead of sharing the browser's. Only called from
++// RenderFrameObserver methods, which all run on the renderer main thread.
++scoped_refptr<const subresource_filter::MemoryMappedRuleset> GetRendererRuleset(
++    const AdblockRuleset::Data& data) {
++  static base::NoDestructor<base::FilePath> mapped_path;
++  static base::NoDestructor<
++      scoped_refptr<const subresource_filter::MemoryMappedRuleset>>
++      ruleset;
++  if (*mapped_path != data.indexed_path() || !*ruleset) {
++    *ruleset = subresource_filter::MemoryMappedRuleset::CreateAndInitialize(
++        base::File(data.indexed_path(),
++                   base::File::FLAG_OPEN | base::File::FLAG_READ));
++    *mapped_path = data.indexed_path();
++  }
++  return *ruleset;
++}
++
++bool IsWebOrigin(const url::Origin& origin) {
++  const std::string& scheme =
++      origin.GetTupleOrPrecursorTupleIfOpaque().scheme();
++  return scheme == url::kHttpScheme || scheme == url::kHttpsScheme;
++}
++
++// Whether `host` is one of `domains` or a subdomain of one.
++bool HostMatchesAny(std::string_view host,
++                    const std::vector<std::string>& domains) {
++  for (const std::string& domain : domains) {
++    if (url::DomainIs(host, domain)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++AdblockRenderFrameObserver::AdblockRenderFrameObserver(
++    content::RenderFrame* render_frame)
++    : content::RenderFrameObserver(render_frame),
++      content::RenderFrameObserverTracker<AdblockRenderFrameObserver>(
++          render_frame) {}
++
++AdblockRenderFrameObserver::~AdblockRenderFrameObserver() = default;
++
++void AdblockRenderFrameObserver::DidCreateNewDocument() {
++  state_ = DocumentState();
++  has_filter_ = false;
++  pending_css_.clear();
++
++  scoped_refptr<const AdblockRuleset::Data> data =
++      AdblockRuleset::GetInstance().GetData();
++  if (!data) {
++    return;
++  }
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  // about:blank and srcdoc frames inherit their creator's origin, so ad
++  // scripts writing into such frames are still filtered.
++  document_origin_ = frame->GetSecurityOrigin();
++  if (!IsWebOrigin(document_origin_)) {
++    return;
++  }
++  scoped_refptr<const subresource_filter::MemoryMappedRuleset> ruleset =
++      GetRendererRuleset(*data);
++  if (!ruleset) {
++    return;
++  }
++
++  // Inherit allowlisting from the parent document (single-process: parents
++  // are local frames unless the page is being torn down).
++  url::Origin parent_origin;
++  if (blink::WebFrame* parent = frame->Parent()) {
++    parent_origin = parent->GetSecurityOrigin();
++    content::RenderFrame* parent_render_frame =
++        parent->IsWebLocalFrame()
++            ? content::RenderFrame::FromWebFrame(parent->ToWebLocalFrame())
++            : nullptr;
++    if (auto* parent_observer =
++            parent_render_frame
++                ? AdblockRenderFrameObserver::Get(parent_render_frame)
++                : nullptr) {
++      state_ = parent_observer->state_;
++    }
++  }
++
++  const GURL document_url = frame->GetDocument().Url();
++  if (document_url.SchemeIsHTTPOrHTTPS()) {
++    subresource_filter::IndexedRulesetMatcher matcher(ruleset->data());
++    auto disabled_by = [&](url_pattern_index::proto::ActivationType type) {
++      return matcher.ShouldDisableFilteringForDocument(document_url,
++                                                       parent_origin, type);
++    };
++    state_.filtering_disabled |= disabled_by(ACTIVATION_TYPE_DOCUMENT);
++    if (!state_.filtering_disabled) {
++      state_.generic_blocking_disabled |=
++          disabled_by(ACTIVATION_TYPE_GENERICBLOCK);
++      state_.hiding_disabled |= disabled_by(ACTIVATION_TYPE_ELEMHIDE);
++      state_.generic_hiding_disabled |=
++          disabled_by(ACTIVATION_TYPE_GENERICHIDE);
++    }
++  }
++  if (state_.filtering_disabled) {
++    return;
++  }
++
++  activation_state_ = subresource_filter::mojom::ActivationState();
++  activation_state_.activation_level =
++      subresource_filter::mojom::ActivationLevel::kEnabled;
++  activation_state_.generic_blocking_rules_disabled =
++      state_.generic_blocking_disabled;
++
++  auto filter =
++      std::make_unique<subresource_filter::WebDocumentSubresourceFilterImpl>(
++          document_origin_, activation_state_, ruleset,
++          /*first_disallowed_load_callback=*/base::OnceClosure());
++
++  if (!state_.hiding_disabled &&
++      base::FeatureList::IsEnabled(
++          web::features::kIOSSideloadAdblockElementHiding)) {
++    // Site-specific rules (`example.com##.ad`), minus `#@#` exceptions.
++    std::vector<std::string_view> selectors;
++    filter->GetDomainSelectors(selectors);
++    for (std::string_view selector : selectors) {
++      pending_css_.append(selector);
++      pending_css_.append(kHideDeclaration);
++    }
++    // Generic rules (`##.ad`): main frames only, as the stylesheet is large
++    // and ad iframes are blocked by the navigation throttle anyway.
++    if (!state_.generic_hiding_disabled && frame->IsOutermostMainFrame()) {
++      pending_css_.append(data->generic_css());
++      const std::string& host =
++          document_origin_.GetTupleOrPrecursorTupleIfOpaque().host();
++      for (const auto& excepted : data->generic_exceptions()) {
++        if (!HostMatchesAny(host, excepted.domains)) {
++          pending_css_.append(excepted.selector);
++          pending_css_.append(kHideDeclaration);
++        }
++      }
++    }
++  }
++
++  // Blink takes ownership of the filter.
++  frame->GetDocumentLoader()->SetSubresourceFilter(filter.release());
++  has_filter_ = true;
++}
++
++void AdblockRenderFrameObserver::DidCreateDocumentElement() {
++  if (pending_css_.empty()) {
++    return;
++  }
++  // A user-origin `!important` declaration wins over the page's own
++  // `!important` styles, so ads cannot un-hide themselves with CSS.
++  render_frame()->GetWebFrame()->GetDocument().InsertStyleSheet(
++      blink::WebString::FromUtf8(pending_css_), /*key=*/nullptr,
++      blink::WebCssOrigin::kUser);
++  pending_css_.clear();
++}
++
++void AdblockRenderFrameObserver::WillCreateWorkerFetchContext(
++    blink::WebWorkerFetchContext* worker_fetch_context) {
++  if (!has_filter_) {
++    return;
++  }
++  scoped_refptr<const AdblockRuleset::Data> data =
++      AdblockRuleset::GetInstance().GetData();
++  if (!data) {
++    return;
++  }
++  base::File ruleset_file(data->indexed_path(),
++                          base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!ruleset_file.IsValid()) {
++    return;
++  }
++  // Dedicated workers and worklets map the ruleset on their own thread.
++  worker_fetch_context->SetSubresourceFilterBuilder(
++      std::make_unique<
++          subresource_filter::WebDocumentSubresourceFilterImpl::BuilderImpl>(
++          document_origin_, activation_state_, std::move(ruleset_file),
++          /*first_disallowed_load_callback=*/base::OnceClosure()));
++}
++
++void AdblockRenderFrameObserver::OnDestruct() {
++  delete this;
++}
++
++}  // namespace web::adblock
+diff --git a/ios/web/content/adblock/adblock_ruleset.h b/ios/web/content/adblock/adblock_ruleset.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..062d797661251000a27807ee4909de962945be7d
+--- /dev/null
++++ b/ios/web/content/adblock/adblock_ruleset.h
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_RULESET_H_
++#define IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_RULESET_H_
++
++#include <stdint.h>
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++
++namespace web::adblock {
++
++// [ios-blink-sideload] Process-wide holder of the ad blocking ruleset.
++//
++// On first launch the bundled filter list is parsed with Chromium's EasyList
++// parser and indexed into the subresource filter's flatbuffer format, which is
++// cached under Library/Caches/SideloadAdblock and reused until the bundled
++// list or the Chromium version changes. The browser process and the in-process
++// renderer (this build runs single-process) share the same files.
++class AdblockRuleset {
++ public:
++  // Immutable once published; safe to use from any thread.
++  class Data : public base::RefCountedThreadSafe<Data> {
++   public:
++    Data();
++    Data(const Data&) = delete;
++    Data& operator=(const Data&) = delete;
++
++    // The indexed ruleset file. Each thread that needs a
++    // subresource_filter::MemoryMappedRuleset (which is not thread-safe) maps
++    // its own copy from this path.
++    const base::FilePath& indexed_path() const { return indexed_path_; }
++
++    // The indexed ruleset, mapped once for browser-side matching.
++    base::span<const uint8_t> indexed_bytes() const LIFETIME_BOUND {
++      return mapped_->bytes();
++    }
++
++    // Generic element hiding rules, as a ready-to-insert stylesheet.
++    const std::string& generic_css() const { return generic_css_; }
++
++    // Generic hiding selectors that some sites except, with those sites.
++    struct ExceptedSelector {
++      ExceptedSelector();
++      ExceptedSelector(const ExceptedSelector&);
++      ExceptedSelector(ExceptedSelector&&);
++      ~ExceptedSelector();
++      std::vector<std::string> domains;
++      std::string selector;
++    };
++    const std::vector<ExceptedSelector>& generic_exceptions() const {
++      return generic_exceptions_;
++    }
++
++   private:
++    friend class base::RefCountedThreadSafe<Data>;
++    friend class AdblockRuleset;
++    ~Data();
++
++    base::FilePath indexed_path_;
++    std::unique_ptr<base::MemoryMappedFile> mapped_;
++    std::string generic_css_;
++    std::vector<ExceptedSelector> generic_exceptions_;
++  };
++
++  static AdblockRuleset& GetInstance();
++
++  AdblockRuleset(const AdblockRuleset&) = delete;
++  AdblockRuleset& operator=(const AdblockRuleset&) = delete;
++
++  // Loads (or builds) the ruleset on a background thread. Call once the task
++  // scheduler is running; later calls do nothing.
++  void StartLoading();
++
++  // Returns the ruleset, or null while loading, if the app bundle has no
++  // filter lists, or if the ad blocker is turned off in chrome://flags.
++  scoped_refptr<const Data> GetData() const;
++
++ private:
++  friend class base::NoDestructor<AdblockRuleset>;
++
++  AdblockRuleset();
++  ~AdblockRuleset();
++
++  static scoped_refptr<const Data> LoadOnBackgroundThread();
++  void Publish(scoped_refptr<const Data> data);
++
++  mutable base::Lock lock_;
++  bool started_ GUARDED_BY(lock_) = false;
++  scoped_refptr<const Data> data_ GUARDED_BY(lock_);
++};
++
++}  // namespace web::adblock
++
++#endif  // IOS_WEB_CONTENT_ADBLOCK_ADBLOCK_RULESET_H_
+diff --git a/ios/web/content/adblock/adblock_ruleset.mm b/ios/web/content/adblock/adblock_ruleset.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a2ec45fe62626a2959ebafa77fd04f1f90ee02a
+--- /dev/null
++++ b/ios/web/content/adblock/adblock_ruleset.mm
+@@ -0,0 +1,300 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/web/content/adblock/adblock_ruleset.h"
++
++#import <Foundation/Foundation.h>
++
++#import <optional>
++#import <string_view>
++#import <utility>
++
++#import "base/apple/foundation_util.h"
++#import "base/base_paths.h"
++#import "base/feature_list.h"
++#import "base/files/file.h"
++#import "base/files/file_enumerator.h"
++#import "base/files/file_util.h"
++#import "base/functional/bind.h"
++#import "base/hash/hash.h"
++#import "base/logging.h"
++#import "base/path_service.h"
++#import "base/strings/string_number_conversions.h"
++#import "base/strings/string_split.h"
++#import "base/strings/string_util.h"
++#import "base/strings/stringprintf.h"
++#import "base/task/thread_pool.h"
++#import "base/timer/elapsed_timer.h"
++#import "components/subresource_filter/core/common/indexed_ruleset.h"
++#import "components/subresource_filter/tools/rule_parser/rule_parser.h"
++#import "components/url_pattern_index/proto/rules.pb.h"
++#import "components/version_info/version_info.h"
++#import "ios/web/common/features.h"
++
++// Used to find the bundle this code is linked into, which holds the lists.
++@interface CRWSideloadAdblockBundleAnchor : NSObject
++@end
++
++@implementation CRWSideloadAdblockBundleAnchor
++@end
++
++namespace web::adblock {
++
++namespace {
++
++constexpr char kFiltersFile[] = "adblock_filters.txt";
++constexpr char kGenericCssFile[] = "adblock_generic.css";
++constexpr char kGenericExceptionsFile[] = "adblock_generic_exceptions.txt";
++constexpr char kCacheDirName[] = "SideloadAdblock";
++constexpr char kIndexedSuffix[] = ".indexed";
++constexpr char kChecksumSuffix[] = ".checksum";
++// Prefix of the histograms IndexedRulesetMatcher::Verify() records.
++constexpr char kUmaTag[] = "SideloadAdblock";
++
++// The directory holding the bundled lists: the bundle this code is linked
++// into (chrome_framework.framework) or the main app bundle.
++base::FilePath FindListsDirectory() {
++  NSArray<NSBundle*>* bundles = @[
++    [NSBundle bundleForClass:[CRWSideloadAdblockBundleAnchor class]],
++    [NSBundle mainBundle]
++  ];
++  for (NSBundle* bundle in bundles) {
++    if (!bundle.resourcePath) {
++      continue;
++    }
++    base::FilePath dir = base::apple::NSStringToFilePath(bundle.resourcePath);
++    if (base::PathExists(dir.Append(kFiltersFile))) {
++      return dir;
++    }
++  }
++  return base::FilePath();
++}
++
++// Parses adblock_generic_exceptions.txt: "domain,domain<TAB>selector" lines.
++std::vector<AdblockRuleset::Data::ExceptedSelector> ParseGenericExceptions(
++    std::string_view text) {
++  std::vector<AdblockRuleset::Data::ExceptedSelector> result;
++  for (std::string_view line : base::SplitStringPiece(
++           text, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    size_t tab = line.find('\t');
++    if (tab == std::string_view::npos || tab == 0 || tab + 1 == line.size()) {
++      continue;
++    }
++    AdblockRuleset::Data::ExceptedSelector entry;
++    entry.domains =
++        base::SplitString(line.substr(0, tab), ",", base::TRIM_WHITESPACE,
++                          base::SPLIT_WANT_NONEMPTY);
++    entry.selector = std::string(line.substr(tab + 1));
++    result.push_back(std::move(entry));
++  }
++  return result;
++}
++
++// Parses `filters` (Adblock Plus syntax, as written by compile_filters.py)
++// and writes the indexed ruleset to `indexed_path`. Returns the checksum, or
++// nullopt on failure.
++std::optional<int> BuildIndexedRuleset(std::string_view filters,
++                                       uint64_t ruleset_id,
++                                       const base::FilePath& indexed_path) {
++  base::ElapsedTimer timer;
++  subresource_filter::RulesetIndexer indexer(ruleset_id);
++  subresource_filter::RuleParser parser;
++  size_t url_rules = 0;
++  size_t style_rules = 0;
++  size_t skipped = 0;
++  for (std::string_view line : base::SplitStringPiece(
++           filters, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    switch (parser.Parse(line)) {
++      case url_pattern_index::proto::RULE_TYPE_URL:
++        if (indexer.AddUrlRule(parser.url_rule().ToProtobuf())) {
++          ++url_rules;
++        } else {
++          ++skipped;
++        }
++        break;
++      case url_pattern_index::proto::RULE_TYPE_STYLE:
++        if (indexer.AddStyleRuleFromProto(parser.style_rule().ToProtobuf())) {
++          ++style_rules;
++        } else {
++          ++skipped;
++        }
++        break;
++      case url_pattern_index::proto::RULE_TYPE_COMMENT:
++        break;
++      default:
++        ++skipped;
++        break;
++    }
++  }
++  indexer.Finish();
++
++  base::FilePath temp_path = indexed_path.AddExtensionASCII("tmp");
++  if (!base::WriteFile(temp_path, indexer.data()) ||
++      !base::ReplaceFile(temp_path, indexed_path, nullptr)) {
++    LOG(WARNING) << "[ios-blink-sideload] adblock: cannot write "
++                 << indexed_path;
++    base::DeleteFile(temp_path);
++    return std::nullopt;
++  }
++  VLOG(1) << "[ios-blink-sideload] adblock: indexed " << url_rules
++          << " URL rules and " << style_rules << " element hiding rules ("
++          << skipped << " skipped) in " << timer.Elapsed();
++  return indexer.GetChecksum();
++}
++
++// Maps `path` and checks it against `checksum`. Returns null on failure.
++std::unique_ptr<base::MemoryMappedFile> MapAndVerify(const base::FilePath& path,
++                                                     int checksum) {
++  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  auto mapped = std::make_unique<base::MemoryMappedFile>();
++  if (!file.IsValid() || !mapped->Initialize(std::move(file)) ||
++      !subresource_filter::IndexedRulesetMatcher::Verify(mapped->bytes(),
++                                                         checksum, kUmaTag)) {
++    return nullptr;
++  }
++  return mapped;
++}
++
++// Removes indexed rulesets left over from other list or Chromium versions.
++void DeleteStaleFiles(const base::FilePath& cache_dir, const std::string& key) {
++  base::FileEnumerator files(cache_dir, /*recursive=*/false,
++                             base::FileEnumerator::FILES);
++  for (base::FilePath path = files.Next(); !path.empty(); path = files.Next()) {
++    if (!base::StartsWith(path.BaseName().value(), key)) {
++      base::DeleteFile(path);
++    }
++  }
++}
++
++}  // namespace
++
++AdblockRuleset::Data::ExceptedSelector::ExceptedSelector() = default;
++AdblockRuleset::Data::ExceptedSelector::ExceptedSelector(
++    const ExceptedSelector&) = default;
++AdblockRuleset::Data::ExceptedSelector::ExceptedSelector(ExceptedSelector&&) =
++    default;
++AdblockRuleset::Data::ExceptedSelector::~ExceptedSelector() = default;
++
++AdblockRuleset::Data::Data() = default;
++AdblockRuleset::Data::~Data() = default;
++
++// static
++AdblockRuleset& AdblockRuleset::GetInstance() {
++  static base::NoDestructor<AdblockRuleset> instance;
++  return *instance;
++}
++
++AdblockRuleset::AdblockRuleset() = default;
++AdblockRuleset::~AdblockRuleset() = default;
++
++void AdblockRuleset::StartLoading() {
++  if (!base::FeatureList::IsEnabled(web::features::kIOSSideloadAdblock)) {
++    return;
++  }
++  {
++    base::AutoLock auto_lock(lock_);
++    if (started_) {
++      return;
++    }
++    started_ = true;
++  }
++  // Pages that load before the ruleset is ready are not filtered, so this
++  // runs at USER_BLOCKING priority. After the first launch it only maps the
++  // cached index.
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++       base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++      base::BindOnce([] {
++        AdblockRuleset::GetInstance().Publish(LoadOnBackgroundThread());
++      }));
++}
++
++scoped_refptr<const AdblockRuleset::Data> AdblockRuleset::GetData() const {
++  if (!base::FeatureList::IsEnabled(web::features::kIOSSideloadAdblock)) {
++    return nullptr;
++  }
++  base::AutoLock auto_lock(lock_);
++  return data_;
++}
++
++void AdblockRuleset::Publish(scoped_refptr<const Data> data) {
++  base::AutoLock auto_lock(lock_);
++  data_ = std::move(data);
++}
++
++// static
++scoped_refptr<const AdblockRuleset::Data>
++AdblockRuleset::LoadOnBackgroundThread() {
++  base::FilePath lists_dir = FindListsDirectory();
++  if (lists_dir.empty()) {
++    LOG(WARNING) << "[ios-blink-sideload] adblock: no filter lists in the app "
++                    "bundle (build with ios_sideload_adblock_lists_dir)";
++    return nullptr;
++  }
++
++  std::string filters;
++  if (!base::ReadFileToString(lists_dir.Append(kFiltersFile), &filters)) {
++    LOG(WARNING) << "[ios-blink-sideload] adblock: cannot read "
++                 << kFiltersFile;
++    return nullptr;
++  }
++
++  auto data = base::MakeRefCounted<Data>();
++  // The generic stylesheet and its exceptions are optional.
++  base::ReadFileToString(lists_dir.Append(kGenericCssFile),
++                         &data->generic_css_);
++  std::string exceptions;
++  if (base::ReadFileToString(lists_dir.Append(kGenericExceptionsFile),
++                             &exceptions)) {
++    data->generic_exceptions_ = ParseGenericExceptions(exceptions);
++  }
++
++  base::FilePath cache_dir;
++  if (!base::PathService::Get(base::DIR_CACHE, &cache_dir)) {
++    return nullptr;
++  }
++  cache_dir = cache_dir.Append(kCacheDirName);
++  if (!base::CreateDirectory(cache_dir)) {
++    LOG(WARNING) << "[ios-blink-sideload] adblock: cannot create " << cache_dir;
++    return nullptr;
++  }
++
++  // The index depends on the list contents, the index format and the parser
++  // (i.e. the Chromium version).
++  const uint32_t list_hash = base::PersistentHash(filters);
++  const std::string key = base::StringPrintf(
++      "%08x-%d-%s", list_hash,
++      subresource_filter::RulesetIndexer::kIndexedFormatVersion,
++      std::string(version_info::GetVersionNumber()).c_str());
++  const base::FilePath indexed_path = cache_dir.Append(key + kIndexedSuffix);
++  const base::FilePath checksum_path = cache_dir.Append(key + kChecksumSuffix);
++  DeleteStaleFiles(cache_dir, key);
++
++  std::string checksum_text;
++  int checksum = 0;
++  if (base::ReadFileToString(checksum_path, &checksum_text) &&
++      base::StringToInt(
++          base::TrimWhitespaceASCII(checksum_text, base::TRIM_ALL),
++          &checksum)) {
++    data->mapped_ = MapAndVerify(indexed_path, checksum);
++  }
++  if (!data->mapped_) {
++    std::optional<int> built =
++        BuildIndexedRuleset(filters, list_hash, indexed_path);
++    if (built && base::WriteFile(checksum_path, base::NumberToString(*built))) {
++      data->mapped_ = MapAndVerify(indexed_path, *built);
++    }
++    if (!data->mapped_) {
++      LOG(WARNING) << "[ios-blink-sideload] adblock: indexing failed";
++      base::DeleteFile(indexed_path);
++      base::DeleteFile(checksum_path);
++      return nullptr;
++    }
++  }
++  data->indexed_path_ = indexed_path;
++  return data;
++}
++
++}  // namespace web::adblock
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+index 63ba2a4af6ab656e18083bf07753c29eb0dba510..117a1a4c69b4a4423343871bdf23007b86c7cf36 100644
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -40,6 +40,7 @@ source_set("init") {
+     "//content/public/renderer",
+     "//ios/web/content",
+     "//ios/web/content:ui",
++    "//ios/web/content/adblock",
+     "//ios/web/content/common:non_code_constants",
+     "//ios/web/public",
+     "//ios/web/public/init",
+diff --git a/ios/web/content/init/ios_browser_main_parts.mm b/ios/web/content/init/ios_browser_main_parts.mm
+index fe48b1f3ae28212599d707b1d177c530df95df29..18ffdc95b650fa1ab087aa96b041c614fbd2698e 100644
+--- a/ios/web/content/init/ios_browser_main_parts.mm
++++ b/ios/web/content/init/ios_browser_main_parts.mm
+@@ -5,6 +5,7 @@
+ #import "ios/web/content/init/ios_browser_main_parts.h"
+ 
+ #import "content/public/common/result_codes.h"
++#import "ios/web/content/adblock/adblock_ruleset.h"
+ #import "ios/web/public/init/web_main_parts.h"
+ #import "ios/web/public/web_client.h"
+ #import "services/device/public/cpp/geolocation/system_geolocation_source_apple.h"
+@@ -42,6 +43,9 @@ int IOSBrowserMainParts::PostCreateThreads() {
+ }
+ 
+ int IOSBrowserMainParts::PreMainMessageLoopRun() {
++  // [ios-blink-sideload] Load the ad blocking ruleset in the background, so
++  // it is ready before the first page (usually a restored tab) loads.
++  adblock::AdblockRuleset::GetInstance().StartLoading();
+   parts_->PreMainMessageLoopRun();
+   return 0;
+ }
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index 59d40919529d9fcd53e04127e85904482fb81081..2b24d8125b68c1f4476cc2d155b0496c573caeac 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -14,6 +14,7 @@
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/browser/web_contents_view_delegate.h"
+ #import "content/public/common/url_constants.h"
++#import "ios/web/content/adblock/adblock_navigation_throttle.h"
+ #import "ios/web/content/common/constants.h"
+ #import "ios/web/content/content_browser_context.h"
+ #import "ios/web/content/init/ios_browser_main_parts.h"
+@@ -262,4 +263,9 @@ void IOSContentBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
+       CreateWebUIURLLoaderFactory(render_frame_host->GetBrowserContext()));
+ }
+ 
++void IOSContentBrowserClient::CreateThrottlesForNavigation(
++    content::NavigationThrottleRegistry& registry) {
++  adblock::AdblockNavigationThrottle::MaybeCreateAndAdd(registry);
++}
++
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+index 7151e98aed94b6f1be2b049d172e6a96a041c7fd..cdfd186b3dfc2632ca3429842f886982cde32d27 100644
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -55,6 +55,9 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+       int render_frame_id,
+       const std::optional<url::Origin>& request_initiator_origin,
+       NonNetworkURLLoaderFactoryMap* factories) override;
++  // [ios-blink-sideload] Ad blocking for iframes.
++  void CreateThrottlesForNavigation(
++      content::NavigationThrottleRegistry& registry) override;
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
+index 5c5a3fd6b8c8c0525d95b85167be2c3378c3e028..a25bf7b74d98211f50e042400376056bf12c2419 100644
+--- a/ios/web/content/init/ios_content_renderer_client.cc
++++ b/ios/web/content/init/ios_content_renderer_client.cc
+@@ -12,6 +12,7 @@
+ #import "components/js_injection/renderer/js_communication.h"
+ #import "content/public/renderer/render_frame.h"
+ #import "content/public/renderer/render_thread.h"
++#import "ios/web/content/adblock/adblock_render_frame_observer.h"
+ #import "third_party/blink/public/platform/web_url_error.h"
+ #import "ui/base/resource/resource_bundle.h"
+ #import "ui/base/webui/web_ui_util.h"
+@@ -63,6 +64,8 @@ void IOSContentRendererClient::RenderFrameCreated(
+   // As a RenderFrameObserver, JSCommunication handles destroying
+   // itself when its RenderFrame is destroyed.
+   new js_injection::JsCommunication(render_frame);
++  // [ios-blink-sideload] Ad blocking; deletes itself with the frame.
++  new adblock::AdblockRenderFrameObserver(render_frame);
+ }
+ 
+ void IOSContentRendererClient::RunScriptsAtDocumentStart(
